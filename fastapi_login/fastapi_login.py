@@ -1,12 +1,10 @@
-import inspect
+import functools
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Collection, Dict, Optional, Type, Union
+from typing import Any, Callable, Collection, Dict, Optional, Type, Union
 
 import jwt
-from anyio.to_thread import run_sync
-from fastapi import FastAPI, Request, Response
-from fastapi.security import OAuth2PasswordBearer, SecurityScopes
-from starlette.middleware.base import BaseHTTPMiddleware
+from flask import Flask, Response, g
+from flask import request as flask_request
 
 from .exceptions import InsufficientScopeException, InvalidCredentialsException
 from .secrets import to_secret
@@ -16,7 +14,7 @@ SECRET_TYPE = Union[str, bytes]
 CUSTOM_EXCEPTION = Union[Type[Exception], Exception]
 
 
-class LoginManager(OAuth2PasswordBearer):
+class LoginManager:
     def __init__(
         self,
         secret: Union[SECRET_TYPE, Dict[str, SECRET_TYPE]],
@@ -42,8 +40,7 @@ class LoginManager(OAuth2PasswordBearer):
             not_authenticated_exception (Union[Type[Exception], Exception]): Exception to raise when the user is not authenticated
                 this defaults to `fastapi_login.exceptions.InvalidCredentialsException`
             default_expiry (datetime.timedelta): The default expiry time of the token, defaults to 15 minutes
-            scopes (Dict[str, str]): Scopes argument of OAuth2PasswordBearer for more information see
-                `https://fastapi.tiangolo.com/advanced/security/oauth2-scopes/#oauth2-security-scheme`
+            scopes (Dict[str, str]): Optional mapping of scope name to description, kept for API compatibility
             out_of_scope_exception (Union[Type[Exception], Exception]): Exception to raise when the user is out of scopes,
                 if not set, default is `fastapi_login.exceptions.InsufficientScopeException`
         """
@@ -56,19 +53,20 @@ class LoginManager(OAuth2PasswordBearer):
 
         self.secret = to_secret({"algorithms": algorithm, "secret": secret})
         self.algorithm = algorithm
+        self.token_url = token_url
         self.oauth_scheme = None
         self.use_cookie = use_cookie
         self.use_header = use_header
         self.cookie_name = cookie_name
         self.default_expiry = default_expiry
+        # kept for API compatibility with the previous OAuth2 based implementation
+        self.auto_error = False
+        self.scopes = scopes
 
         # private
         self._user_callback: Optional[ordered_partial] = None
         self._not_authenticated_exception = not_authenticated_exception
         self._out_of_scope_exception = out_of_scope_exception
-
-        # we take over the exception raised possibly by setting auto_error to False
-        super().__init__(tokenUrl=token_url, auto_error=False, scopes=scopes)
 
     @property
     def out_of_scope_exception(self):
@@ -86,7 +84,7 @@ class LoginManager(OAuth2PasswordBearer):
         """
         return self._not_authenticated_exception
 
-    def user_loader(self, *args, **kwargs) -> Union[Callable, Callable[..., Awaitable]]:
+    def user_loader(self, *args, **kwargs) -> Callable:
         """
         This sets the callback to retrieve the user.
         The function should take an unique identifier like an email
@@ -94,14 +92,14 @@ class LoginManager(OAuth2PasswordBearer):
 
         Basic usage:
 
-            >>> from fastapi import FastAPI
+            >>> from flask import Flask
             >>> from fastapi_login import LoginManager
 
-            >>> app = FastAPI()
+            >>> app = Flask(__name__)
             >>> # use import secrets; print(secrets.token_hex(24)) to get a suitable secret key
             >>> SECRET = "super-secret"
 
-            >>> manager = LoginManager(SECRET, token_url="Login")
+            >>> manager = LoginManager(SECRET, token_url="/login")
 
             >>> manager.user_loader()(get_user)
 
@@ -117,11 +115,11 @@ class LoginManager(OAuth2PasswordBearer):
             The callback
         """
 
-        def decorator(callback: Union[Callable, Callable[..., Awaitable]]):
+        def decorator(callback: Callable):
             """
             The actual setter of the load_user callback
             Args:
-                callback (Callable or Awaitable): The callback which returns the user
+                callback (Callable): The callback which returns the user
 
             Returns:
                 Partial of the callback with given args and keyword arguments already set
@@ -156,7 +154,7 @@ class LoginManager(OAuth2PasswordBearer):
             raise self.not_authenticated_exception
 
     def _has_scopes(
-        self, payload: Dict[str, Any], required_scopes: Optional[SecurityScopes]
+        self, payload: Dict[str, Any], required_scopes: Optional[Collection[str]]
     ) -> bool:
         """
         Returns true if the required scopes are present in the token
@@ -168,23 +166,25 @@ class LoginManager(OAuth2PasswordBearer):
         Returns:
             True if the required scopes are contained in the tokens payload
         """
-        if required_scopes is None or not required_scopes.scopes:
+        if not required_scopes:
             # According to RFC 6749, the scopes are optional
             return True
 
-        # when the manager was invoked using fastapi.Security(manager, scopes=[...])
+        # when the route was protected using manager.login_required(scopes=[...])
         # we have to check if all required scopes are contained in the token
         provided_scopes = payload.get("scopes", [])
         # Check if enough scopes are present
-        if len(provided_scopes) < len(required_scopes.scopes):
+        if len(provided_scopes) < len(required_scopes):
             return False
         # Check if all required scopes are present
-        elif any(scope not in provided_scopes for scope in required_scopes.scopes):
+        elif any(scope not in provided_scopes for scope in required_scopes):
             return False
 
         return True
 
-    def has_scopes(self, token: str, required_scopes: SecurityScopes) -> bool:
+    def has_scopes(
+        self, token: str, required_scopes: Optional[Collection[str]]
+    ) -> bool:
         """
         Combines `_get_payload` and `_has_scopes` to check if the token has the required scopes
 
@@ -198,7 +198,7 @@ class LoginManager(OAuth2PasswordBearer):
         payload = self._get_payload(token)
         return self._has_scopes(payload, required_scopes)
 
-    async def _get_current_user(self, payload: Dict[str, Any]):
+    def _get_current_user(self, payload: Dict[str, Any]):
         """
         This decodes the jwt based on the secret and the algorithm set on the instance.
         If the token is correctly formatted and the user is found the user object
@@ -218,13 +218,13 @@ class LoginManager(OAuth2PasswordBearer):
         if user_identifier is None:
             raise self.not_authenticated_exception
 
-        user = await self._load_user(user_identifier)
+        user = self._load_user(user_identifier)
         if user is None:
             raise self.not_authenticated_exception
 
         return user
 
-    async def get_current_user(self, token: str) -> Any:
+    def get_current_user(self, token: str) -> Any:
         """
         Combines `_get_payload` and `_get_current_user` to get the user object
 
@@ -238,9 +238,9 @@ class LoginManager(OAuth2PasswordBearer):
             LoginManager.not_authenticated_exception: The token is invalid or None was returned by `_load_user`
         """
         payload = self._get_payload(token)
-        return await self._get_current_user(payload)
+        return self._get_current_user(payload)
 
-    async def _load_user(self, identifier: Any):
+    def _load_user(self, identifier: Any):
         """
         This loads the user using the user_callback
 
@@ -256,12 +256,7 @@ class LoginManager(OAuth2PasswordBearer):
         if self._user_callback is None:
             raise Exception("Missing user_loader callback")
 
-        if inspect.iscoroutinefunction(self._user_callback):
-            user = await self._user_callback(identifier)
-        else:
-            user = await run_sync(self._user_callback, identifier)
-
-        return user
+        return self._user_callback(identifier)
 
     def create_access_token(
         self,
@@ -305,24 +300,46 @@ class LoginManager(OAuth2PasswordBearer):
         Utility function to set a cookie containing token on the response
 
         Args:
-            response (fastapi.Response): The response which is send back
+            response (flask.Response): The response which is send back
             token (str): The created JWT
         """
-        response.set_cookie(key=self.cookie_name, value=token, httponly=True)
+        response.set_cookie(
+            self.cookie_name, token, httponly=True, samesite="lax"
+        )
 
-    def _token_from_cookie(self, request: Request) -> Optional[str]:
+    def _token_from_cookie(self, request) -> Optional[str]:
         """
         Checks the requests cookies for cookies with the value of`self.cookie_name` as name
 
         Args:
-            request (fastapi.Request): The request to the route, normally filled in automatically
+            request (flask.Request): The request to the route, normally filled in automatically
 
         Returns:
             The access token found in the cookies of the request or None
         """
         return request.cookies.get(self.cookie_name) or None
 
-    async def _get_token(self, request: Request):
+    def _token_from_header(self, request) -> Optional[str]:
+        """
+        Extracts a bearer token from the ``Authorization`` header of the request.
+
+        Args:
+            request (flask.Request): The request to the route
+
+        Returns:
+            The bearer token found in the header or None
+        """
+        authorization = request.headers.get("Authorization")
+        if not authorization:
+            return None
+
+        scheme, _, param = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not param:
+            return None
+
+        return param
+
+    def _get_token(self, request):
         """
         Tries to extract the token from the request, based on self.use_header and self.use_cookie
 
@@ -340,70 +357,103 @@ class LoginManager(OAuth2PasswordBearer):
             token = self._token_from_cookie(request)
 
         if not token and self.use_header:
-            token = await super(LoginManager, self).__call__(request)
+            token = self._token_from_header(request)
 
         if not token:
             raise self.not_authenticated_exception
 
         return token
 
-    async def __call__(
+    def __call__(
         self,
-        request: Request,
-        security_scopes: SecurityScopes = None,  # type: ignore
+        request=None,
+        scopes: Optional[Collection[str]] = None,
     ) -> Any:
         """
-        Provides the functionality to act as a Dependency
+        Resolves the current user for the active request.
 
         Args:
-            request (fastapi.Request):The incoming request, this is set automatically
-                by FastAPI
+            request (flask.Request): The incoming request. When omitted the
+                current ``flask.request`` proxy is used.
+            scopes (Collection[str]): Scopes required to access the route
 
         Returns:
-            The user object or None
+            The user object
 
         Raises:
-            LoginManager.not_authenticated_exception: If set by the user and `self.auto_error` is set to False
-
+            LoginManager.not_authenticated_exception: If no (valid) token is present
+            LoginManager.out_of_scope_exception: If the token misses a required scope
         """
-        token = await self._get_token(request)
+        if request is None:
+            request = flask_request
+
+        token = self._get_token(request)
         payload = self._get_payload(token)
 
-        if not self._has_scopes(payload, security_scopes):
+        if not self._has_scopes(payload, scopes):
             raise self._out_of_scope_exception
 
-        return await self._get_current_user(payload)
+        return self._get_current_user(payload)
 
-    async def optional(self, request: Request, security_scopes: SecurityScopes = None):  # type: ignore
+    def login_required(self, func: Optional[Callable] = None, *, scopes: Optional[Collection[str]] = None):
         """
-        Acts as a dependency which catches all errors and returns `None` instead
+        Decorator to protect a Flask view. Resolves the current user (storing it
+        on ``flask.g.user``) before the view runs and raises
+        ``not_authenticated_exception`` / ``out_of_scope_exception`` otherwise.
+
+        Can be used bare or with scopes:
+
+            >>> @app.get("/private")
+            >>> @manager.login_required
+            >>> def private():
+            ...     ...
+
+            >>> @app.get("/admin")
+            >>> @manager.login_required(scopes=["admin"])
+            >>> def admin():
+            ...     ...
+        """
+
+        def decorator(view: Callable) -> Callable:
+            @functools.wraps(view)
+            def wrapper(*args, **kwargs):
+                g.user = self.__call__(scopes=scopes)
+                return view(*args, **kwargs)
+
+            return wrapper
+
+        if func is not None:
+            return decorator(func)
+
+        return decorator
+
+    def optional(
+        self,
+        request=None,
+        scopes: Optional[Collection[str]] = None,
+    ):
+        """
+        Resolves the current user but catches all errors and returns ``None`` instead
         """
         try:
-            user = await self.__call__(request, security_scopes)
+            user = self.__call__(request, scopes)
         except Exception:
             return None
         else:
             return user
 
-    def attach_middleware(self, app: FastAPI):
+    def attach_middleware(self, app: Flask):
         """
-        Add the instance as a middleware, which adds the user object, if present,
-        to the request state
+        Register a ``before_request`` handler which adds the user object, if
+        present, to ``flask.g`` under the ``user`` attribute.
 
         Args:
-            app (fastapi.FastAPI): FastAPI application
+            app (flask.Flask): Flask application
         """
 
-        async def __set_user(request: Request, call_next):
-            try:
-                request.state.user = await self.__call__(request)
-            except Exception:
-                # An error occurred while getting the user
-                # as middlewares are called for every incoming request
-                # it's not a good idea to return the Exception
-                # so we set the user to None
-                request.state.user = None
-
-            return await call_next(request)
-
-        app.add_middleware(BaseHTTPMiddleware, dispatch=__set_user)
+        @app.before_request
+        def _set_user():
+            # before_request handlers are called for every incoming request;
+            # optional() swallows any error and yields None so the request can
+            # continue and the view decides what to do with an anonymous user.
+            g.user = self.optional()

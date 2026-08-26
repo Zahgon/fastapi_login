@@ -2,8 +2,7 @@ import secrets
 from typing import Callable, Dict
 
 import pytest
-from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from flask import Flask
 from pydantic import BaseModel
 
 from fastapi_login import LoginManager
@@ -51,7 +50,8 @@ class User(BaseModel):
 
 @pytest.fixture(scope="module")
 def app():
-    _app = FastAPI()
+    _app = Flask(__name__)
+    _app.testing = True
     yield _app
 
 
@@ -109,11 +109,7 @@ def token_url() -> str:
 
 @pytest.fixture(scope="module")
 def client(app):
-    return AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test",
-        follow_redirects=True,
-    )
+    return app.test_client()
 
 
 @pytest.fixture()

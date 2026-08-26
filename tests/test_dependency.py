@@ -1,8 +1,22 @@
 import pytest
-from fastapi import Depends, Security
+from flask import request
 from pytest_lazy_fixtures import lf
 
 from fastapi_login import LoginManager
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _register_all_routes(
+    header_manager, cookie_manager, cookie_header_manager, scoped_manager
+):
+    # Flask locks route registration once the app has handled its first
+    # request (Flask's @setupmethod guard). FastAPI/Starlette allowed routes
+    # to be added dynamically after startup, so the original module-scoped
+    # manager fixtures could register their routes lazily on first use. Under
+    # Flask every route must be registered during module setup, before any
+    # test issues a request. Depending on all four manager fixtures here
+    # forces them to run (and register their routes) up front.
+    yield
 
 
 @pytest.fixture(scope="module")
@@ -11,7 +25,8 @@ def header_manager(app, secret, token_url, load_user_fn) -> LoginManager:
     instance.user_loader()(load_user_fn)
 
     @app.get("/private/header")
-    def private_header_route(_=Depends(instance)):
+    @instance.login_required
+    def private_header_route():
         return {"detail": "Success"}
 
     return instance
@@ -23,7 +38,8 @@ def cookie_manager(app, secret, token_url, load_user_fn) -> LoginManager:
     instance.user_loader()(load_user_fn)
 
     @app.get("/private/cookie")
-    def private_cookie_route(_=Depends(instance)):
+    @instance.login_required
+    def private_cookie_route():
         return {"detail": "Success"}
 
     return instance
@@ -35,11 +51,14 @@ def cookie_header_manager(app, secret, token_url, load_user_fn) -> LoginManager:
     instance.user_loader()(load_user_fn)
 
     @app.get("/private/both")
-    def private_route(_=Depends(instance)):
+    @instance.login_required
+    def private_route():
         return {"detail": "Success"}
 
     @app.get("/private/optional")
-    def optional_user_route(user=Depends(instance.optional), invalid: int = 0):
+    def optional_user_route():
+        user = instance.optional()
+        invalid = request.args.get("invalid", 0, type=int)
         if user is None and invalid == 1:
             return {"detail": "Success"}
         elif user is not None and invalid == 0:
@@ -56,80 +75,75 @@ def scoped_manager(app, secret, token_url, load_user_fn) -> LoginManager:
     instance.user_loader()(load_user_fn)
 
     @app.get("/private/scoped")
-    def private_scoped_route(_=Security(instance, scopes=["read"])):
+    @instance.login_required(scopes=["read"])
+    def private_scoped_route():
         return {"detail": "Success"}
 
     return instance
 
 
-@pytest.mark.asyncio
-async def test_header_dependency(client, header_manager, default_data):
+def test_header_dependency(client, header_manager, default_data):
     token = header_manager.create_access_token(data=default_data)
-    resp = await client.get(
+    resp = client.get(
         "/private/header", headers={"Authorization": f"Bearer {token}"}
     )
 
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "Success"
+    assert resp.get_json()["detail"] == "Success"
 
 
-@pytest.mark.asyncio
-async def test_cookie_dependency(client, cookie_manager, default_data):
+def test_cookie_dependency(client, cookie_manager, default_data):
     token = cookie_manager.create_access_token(data=default_data)
-    client._cookies = client._merge_cookies({cookie_manager.cookie_name: token})
-    resp = await client.get("/private/cookie")
-    client._cookies.clear()
+    client.set_cookie(cookie_manager.cookie_name, token)
+    resp = client.get("/private/cookie")
+    client.delete_cookie(cookie_manager.cookie_name)
 
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "Success"
+    assert resp.get_json()["detail"] == "Success"
 
 
-@pytest.mark.asyncio
-async def test_cookie_header_fallback(client, cookie_header_manager, default_data):
+def test_cookie_header_fallback(client, cookie_header_manager, default_data):
     token = cookie_header_manager.create_access_token(data=default_data)
-    client._cookies.clear()
-    resp = await client.get(
+    client.delete_cookie(cookie_header_manager.cookie_name)
+    resp = client.get(
         "/private/both", headers={"Authorization": f"Bearer {token}"}
     )
 
     # even tough no valid access cookie is present,
     # as use_header is enabled the request is valid
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "Success"
+    assert resp.get_json()["detail"] == "Success"
 
 
-@pytest.mark.asyncio
-async def test_scoped_dependency(client, scoped_manager, default_data):
+def test_scoped_dependency(client, scoped_manager, default_data):
     token = scoped_manager.create_access_token(data=default_data, scopes=["read"])
-    resp = await client.get(
+    resp = client.get(
         "/private/scoped", headers={"Authorization": f"Bearer {token}"}
     )
 
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "Success"
+    assert resp.get_json()["detail"] == "Success"
 
 
-@pytest.mark.asyncio
-async def test_scoped_dependency_raises(client, scoped_manager, default_data):
+def test_scoped_dependency_raises(client, scoped_manager, default_data):
     token = scoped_manager.create_access_token(data=default_data)
-    resp = await client.get(
+    resp = client.get(
         "/private/scoped", headers={"Authorization": f"Bearer {token}"}
     )
     assert resp.status_code == 400
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "data, is_invalid",
     [(lf("default_data"), 0), (lf("invalid_data"), 1)],
 )
-async def test_optional_dependency(client, cookie_header_manager, data, is_invalid):
+def test_optional_dependency(client, cookie_header_manager, data, is_invalid):
     token = cookie_header_manager.create_access_token(data=data)
-    resp = await client.get(
+    resp = client.get(
         "/private/optional",
         headers={"Authorization": f"Bearer {token}"},
-        params={"invalid": is_invalid},
+        query_string={"invalid": is_invalid},
     )
 
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "Success"
+    assert resp.get_json()["detail"] == "Success"
